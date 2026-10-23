@@ -1,4 +1,4 @@
-import type { AutocompleteProvider, AutocompleteSuggestions } from "../autocomplete.ts";
+import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "../autocomplete.ts";
 import { getKeybindings } from "../keybindings.ts";
 import { decodePrintableKey, matchesKey } from "../keys.ts";
 import { KillRing } from "../kill-ring.ts";
@@ -754,13 +754,17 @@ export class Editor implements Component, Focusable {
 			return;
 		}
 
+		// Escape also cancels a pending request before its picker is available.
+		if (
+			(this.autocompleteState || this.autocompleteAbort || this.autocompleteDebounceTimer) &&
+			kb.matches(data, "tui.select.cancel")
+		) {
+			this.cancelAutocomplete();
+			return;
+		}
+
 		// Handle autocomplete mode
 		if (this.autocompleteState && this.autocompleteList) {
-			if (kb.matches(data, "tui.select.cancel")) {
-				this.cancelAutocomplete();
-				return;
-			}
-
 			if (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down")) {
 				this.autocompleteList.handleInput(data);
 				return;
@@ -769,20 +773,7 @@ export class Editor implements Component, Focusable {
 			if (kb.matches(data, "tui.input.tab")) {
 				const selected = this.autocompleteList.getSelectedItem();
 				if (selected && this.autocompleteProvider) {
-					this.pushUndoSnapshot();
-					this.lastAction = null;
-					const result = this.autocompleteProvider.applyCompletion(
-						this.state.lines,
-						this.state.cursorLine,
-						this.state.cursorCol,
-						selected,
-						this.autocompletePrefix,
-					);
-					this.state.lines = result.lines;
-					this.state.cursorLine = result.cursorLine;
-					this.setCursorCol(result.cursorCol);
-					this.cancelAutocomplete();
-					if (this.onChange) this.onChange(this.getText());
+					this.acceptAutocompleteSelection(selected);
 				}
 				return;
 			}
@@ -2239,24 +2230,53 @@ export class Editor implements Component, Focusable {
 	): SelectList {
 		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
 		const list = new SelectList(items, this.autocompleteMaxVisible, this.theme.selectList, layout);
-		list.onSelect = (selected) => {
-			if (!this.autocompleteProvider) return;
-			this.pushUndoSnapshot();
-			this.lastAction = null;
-			const result = this.autocompleteProvider.applyCompletion(
-				this.state.lines,
-				this.state.cursorLine,
-				this.state.cursorCol,
-				selected,
-				this.autocompletePrefix,
-			);
-			this.state.lines = result.lines;
-			this.state.cursorLine = result.cursorLine;
-			this.setCursorCol(result.cursorCol);
-			this.cancelAutocomplete();
-			this.onChange?.(this.getText());
-		};
+		list.onSelect = (selected) => this.acceptAutocompleteSelection(selected);
 		return list;
+	}
+
+	private acceptAutocompleteSelection(selected: AutocompleteItem): void {
+		const provider = this.autocompleteProvider;
+		if (!provider) return;
+
+		const prefix = this.autocompletePrefix;
+		const beforeCursor = (this.state.lines[this.state.cursorLine] || "").slice(0, this.state.cursorCol);
+		const isCommandName =
+			this.autocompleteState === "regular" &&
+			this.isInSlashCommandContext(beforeCursor) &&
+			prefix.startsWith("/") &&
+			!prefix.slice(1).includes("/") &&
+			!beforeCursor.trimStart().includes(" ");
+
+		this.pushUndoSnapshot();
+		this.lastAction = null;
+		const result = provider.applyCompletion(
+			this.state.lines,
+			this.state.cursorLine,
+			this.state.cursorCol,
+			selected,
+			prefix,
+		);
+		this.state.lines = result.lines;
+		this.state.cursorLine = result.cursorLine;
+		this.setCursorCol(result.cursorCol);
+		this.cancelAutocomplete();
+
+		const startToken = this.autocompleteStartToken;
+		const requestId = this.autocompleteRequestId;
+		const snapshotText = this.getText();
+		const snapshotLine = this.state.cursorLine;
+		const snapshotCol = this.state.cursorCol;
+		this.onChange?.(snapshotText);
+
+		if (
+			isCommandName &&
+			provider === this.autocompleteProvider &&
+			startToken === this.autocompleteStartToken &&
+			this.isAutocompleteRequestCurrent(requestId, undefined, snapshotText, snapshotLine, snapshotCol) &&
+			/^\s*\/\S+ $/.test((this.state.lines[snapshotLine] || "").slice(0, snapshotCol))
+		) {
+			this.tryTriggerAutocomplete();
+		}
 	}
 
 	private tryTriggerAutocomplete(explicitTab: boolean = false): void {
@@ -2415,13 +2435,13 @@ export class Editor implements Component, Focusable {
 
 	private isAutocompleteRequestCurrent(
 		requestId: number,
-		controller: AbortController,
+		controller: AbortController | undefined,
 		snapshotText: string,
 		snapshotLine: number,
 		snapshotCol: number,
 	): boolean {
 		return (
-			!controller.signal.aborted &&
+			!controller?.signal.aborted &&
 			requestId === this.autocompleteRequestId &&
 			this.getText() === snapshotText &&
 			this.state.cursorLine === snapshotLine &&
